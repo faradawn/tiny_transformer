@@ -1,14 +1,24 @@
+from attention import Attention
 import torch
-import math
+import torch.nn as nn
 import torch.nn.functional as F
-T = 5
-D = 16
-Q = torch.randint(0, 3, (T, D), dtype=torch.long)
-K = torch.randint(0, 3, (3, D), dtype=torch.long)
+import math
+import numpy as np
+import os
 
-d_k = K.size(-1)
-print(d_k)
-att = Q @ K.transpose(-2, -1) / math.sqrt(d_k)
-print("QK",att) # [T, 3]
-att = F.softmax(att, dim=-1)
-print("after softmax", att) # [T, 1]
+class Attention(nn.Module):
+    def __init__(self, D): # model size 
+        super().__init__()
+        self.W_q = nn.Linear(D, D)
+        self.W_k = nn.Linear(D, D)
+        self.W_v = nn.Linear(D, D)
+
+    def forward(self, x):
+        Q = self.W_q(x)
+        K = self.W_k(x)
+        V = self.W_v(x)
+
+        att = Q @ K.transpose(-2, -1) / math.sqrt(K.size(-1))
+        att = F.softmax(att, dim=-1)
+        out = att @ V
+        return out
