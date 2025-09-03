@@ -24,11 +24,11 @@ x
 """
 
 class Attention(nn.Module):
-    def __init__(self, D, d_head) -> None: # D is model dimension, d_head is hidden dimension (intermediate size)
+    def __init__(self, D) -> None: # D is model dimension, D is hidden dimension (intermediate size)
         super().__init__()
-        self.W_q = nn.Linear(D, d_head)
-        self.W_k = nn.Linear(D, d_head)
-        self.W_v = nn.Linear(D, d_head)
+        self.W_q = nn.Linear(D, D)
+        self.W_k = nn.Linear(D, D)
+        self.W_v = nn.Linear(D, D)
         self.att_dropout = nn.Dropout()
         self.last_dropout = nn.Dropout()
 
@@ -47,6 +47,35 @@ class Attention(nn.Module):
         out = att @ V
         out = self.last_dropout(out)
         return out
+
+class MHA(nn.Module):
+    def __init__(self, D, nh):
+        super().__init__()
+        self.c_attn = nn.Linear(D, 3 * D)
+        self.head_dim = D // nh # head dimension is model size divided by num of head
+        self.nh = nh
+    def forward(self, x):
+        B, T, D = x.size()
+        
+        combined_QKV = self.c_attn(x) # (B, T, 3D) -> [QQ, KK, VV]
+        q, k, v = combined_QKV.split(D, dim=2) # split on last dim -> each is (B, T, D) and D = nh * head_dim
+        q = q.view(B, T, self.nh, self.head_dim) # (B, T, nh, head_dim)
+        q = q.transpose(1,2) # (B, nh, T, head_dim)
+        k = k.view(B, T, self.nh, self.head_dim) # (B, T, nh, head_dim)
+        k = k.transpose(1,2) # (B, nh, T, head_dim)
+        v = v.view(B, T, self.nh, self.head_dim) # (B, T, nh, head_dim)
+        v = v.transpose(1,2) # (B, nh, T, head_dim)
+
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1)) # attention shape (B, nh, T, T)
+        mask = torch.triu(torch.ones(T, T, dtype=bool), diagonal=1)
+        mask = mask.view(1, 1, T, T)
+        att.masked_fill(mask, float('-inf'))
+
+        att = F.softmax(att, dim=-1)
+        out = att @ v # (B, nh, T, head_dim)
+        out = out.transpose(1, 2).contiguous().view(B, T, D)
+        return out
+        
 
 class MLP(nn.Module):
     def __init__(self, d_inter, d_ff = None): 
@@ -67,10 +96,11 @@ class MLP(nn.Module):
         return x
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, d_head, d_inter, d_ff) -> None:
+    def __init__(self, d_model, nh, d_inter, d_ff) -> None:
         super().__init__()
         self.layer_norm_1 = nn.LayerNorm(d_inter)
-        self.att = Attention(d_inter, d_head)
+        # self.att = Attention(d_model)
+        self.att = MHA(d_model, nh)
         self.layer_norm_2 = nn.LayerNorm(d_inter)
         self.mlp = MLP(d_inter, d_ff)
     
@@ -80,36 +110,64 @@ class TransformerBlock(nn.Module):
         return x
 
 class TransformerModel(nn.Module):
-    def __init__(self, n_layers, d_model, d_head, d_inter, d_ff, vocab_size):
+    def __init__(self, n_layers, d_model, nh, d_inter, d_ff, vocab_size):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_inter)
         self.pos_emb = nn.Embedding(vocab_size, d_inter)
-        self.transformer_blocks = nn.ModuleList([TransformerBlock(d_model, d_head, d_inter, d_ff) for _ in range(n_layers)])
+        self.transformer_blocks = nn.ModuleList([TransformerBlock(d_model, nh, d_inter, d_ff) for _ in range(n_layers)])
         self.logits_layer = nn.Linear(d_inter, vocab_size)
     
     def forward(self, idx):
         b, t = idx.size()
         pos = torch.arange(0, t)
-        x = self.token_emb(idx) + self.pos_emb(pos)
+        x = self.token_emb(idx) + self.pos_emb(pos) # -> (batch size, sequence length, model_size)
         for layer in self.transformer_blocks:
             x = layer(x)
         
         logits = self.logits_layer(x)
         return logits
-
-if __name__ == "__main__":
+    
+def test_attention():
+    vocab_size = 129280 # vocab_size
     n_layers = 2 
     d_model = 16 # hidden size
-    d_head = d_model # q k v_head_dim
+    nh = 1 # 
     d_inter = d_model # intermediate_size
     d_ff = 128 # moe_intermediate_size
+    x = torch.randint(0, 100, size=(3, 100)) # (batch size, prompt length)
+    model = TransformerModel(n_layers, d_model, nh, d_inter, d_ff, vocab_size)
+    model(x)
+
+def test_mha():
     vocab_size = 129280 # vocab_size
+    n_layers = 2 
+    d_model = 16 # hidden size
+    nh = 2 # q k v_head_dim
+    d_inter = d_model # intermediate_size
+    d_ff = 128 # moe_intermediate_size
+    x = torch.randint(0, 100, size=(3, 100)) # (batch size, prompt length)
+    model = TransformerModel(n_layers, d_model, nh, d_inter, d_ff, vocab_size)
+    model(x)
+
+if __name__ == "__main__":
+
+    # test_mha()
+    vocab_size = 129280 # vocab_size
+    n_layers = 2 
+    d_model = 16 # hidden size
+    nh = 2 # q k v_head_dim
+    d_inter = d_model # intermediate_size
+    d_ff = 128 # moe_intermediate_size
+
+    
     epoches = 10
     gradient_accumulation_steps = 4
 
     # hyper-parameters for batching
     batch_size = 32         # number of sequences processed in parallel
     block_size = 128        # length of each sequence ("time" dimension)
+
+    
 
     DATA_DIR = os.path.join(os.path.dirname(__file__), "shakespear")
     train_data_np = np.fromfile(os.path.join(DATA_DIR, "train.bin"), dtype=np.uint16)
@@ -137,7 +195,7 @@ if __name__ == "__main__":
         return x.to(device), y.to(device)
     
     # Define model
-    model = TransformerModel(n_layers, d_model, d_head, d_inter, d_ff, vocab_size)
+    model = TransformerModel(n_layers, d_model, nh, d_inter, d_ff, vocab_size)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # Training loop
