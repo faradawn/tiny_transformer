@@ -24,13 +24,11 @@ x
 """
 
 class Attention(nn.Module):
-    def __init__(self, D) -> None: # D is model dimension, D is hidden dimension (intermediate size)
+    def __init__(self, D) -> None: # D is model dimension
         super().__init__()
         self.W_q = nn.Linear(D, D)
         self.W_k = nn.Linear(D, D)
         self.W_v = nn.Linear(D, D)
-        self.att_dropout = nn.Dropout()
-        self.last_dropout = nn.Dropout()
 
     def forward(self, x):
         B, T, D = x.size()
@@ -38,15 +36,31 @@ class Attention(nn.Module):
         K = self.W_k(x)
         V = self.W_v(x)
         att = Q @ K.transpose(-2, -1) / math.sqrt(K.size(-1)) # swaps the last two dimensions
-        mask = torch.triu(torch.ones(T, T, dtype=bool), diagonal=1)
-        mask = mask.view(1, T, T)
+        mask = torch.triu(torch.ones(T, T, dtype=bool), diagonal=1).view(1, T, T)
         att.masked_fill(mask, float('-inf'))
 
         att = F.softmax(att, dim=-1)
-        att = self.att_dropout(att)
         out = att @ V
-        out = self.last_dropout(out)
         return out
+
+class MHA_loop(nn.Module):
+    def __init__(self, D, nh):
+        super().__init__()
+        self.head_dim = D // nh
+        self.nh = nh
+        self.heads = nn.ModuleList([Attention(D) for _ in range(nh)])
+        self.out_proj = nn.Linear(nh * D, D)
+    
+    def forward(self, x):
+        head_outputs = []
+        for head in self.heads:
+            single_output = head(x) # (B, T, head_dim)
+            head_outputs.append(single_output)
+
+        out = torch.cat(head_outputs, dim=-1) # (B, T, nh * head_dim)
+        out = self.out_proj(out)
+        return out
+        
 
 class MHA(nn.Module):
     def __init__(self, D, nh):
@@ -59,12 +73,9 @@ class MHA(nn.Module):
         
         combined_QKV = self.c_attn(x) # (B, T, 3D) -> [QQ, KK, VV]
         q, k, v = combined_QKV.split(D, dim=2) # split on last dim -> each is (B, T, D) and D = nh * head_dim
-        q = q.view(B, T, self.nh, self.head_dim) # (B, T, nh, head_dim)
-        q = q.transpose(1,2) # (B, nh, T, head_dim)
-        k = k.view(B, T, self.nh, self.head_dim) # (B, T, nh, head_dim)
-        k = k.transpose(1,2) # (B, nh, T, head_dim)
-        v = v.view(B, T, self.nh, self.head_dim) # (B, T, nh, head_dim)
-        v = v.transpose(1,2) # (B, nh, T, head_dim)
+        q = q.view(B, T, self.nh, self.head_dim).transpose(1,2) # (B, T, nh, head_dim) -> (B, nh, T, head_dim)
+        k = k.view(B, T, self.nh, self.head_dim).transpose(1,2) # (B, nh, T, head_dim)
+        v = v.view(B, T, self.nh, self.head_dim).transpose(1,2) # (B, nh, T, head_dim)
 
         att = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1)) # attention shape (B, nh, T, T)
         mask = torch.triu(torch.ones(T, T, dtype=bool), diagonal=1)
@@ -100,7 +111,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.layer_norm_1 = nn.LayerNorm(d_inter)
         # self.att = Attention(d_model)
-        self.att = MHA(d_model, nh)
+        self.att = MHA_loop(d_model, nh)
         self.layer_norm_2 = nn.LayerNorm(d_inter)
         self.mlp = MLP(d_inter, d_ff)
     
@@ -141,8 +152,8 @@ def test_attention():
 def test_mha():
     vocab_size = 129280 # vocab_size
     n_layers = 2 
-    d_model = 16 # hidden size
-    nh = 2 # q k v_head_dim
+    d_model = 128 # hidden size
+    nh = 16 # q k v_head_dim
     d_inter = d_model # intermediate_size
     d_ff = 128 # moe_intermediate_size
     x = torch.randint(0, 100, size=(3, 100)) # (batch size, prompt length)
@@ -154,13 +165,13 @@ if __name__ == "__main__":
     # test_mha()
     vocab_size = 129280 # vocab_size
     n_layers = 2 
-    d_model = 16 # hidden size
-    nh = 2 # q k v_head_dim
+    d_model = 128 # hidden size
+    nh = 16 # q k v_head_dim
     d_inter = d_model # intermediate_size
     d_ff = 128 # moe_intermediate_size
 
     
-    epoches = 10
+    epoches = 5
     gradient_accumulation_steps = 4
 
     # hyper-parameters for batching
@@ -176,8 +187,8 @@ if __name__ == "__main__":
     train_data = torch.from_numpy(train_data_np.astype(np.int64))
     val_data   = torch.from_numpy(val_data_np.astype(np.int64))
 
-    print("train shape", train_data.size())
-    print("val shape", val_data.size())
+    # print("train shape", train_data.size())
+    # print("val shape", val_data.size())
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -199,16 +210,20 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # Training loop
+    from time import time
+    t0 = time()
     for e in range(epoches):
         x, y = get_batch('train')    
         logits = model(x)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
         loss.backward()
-        print("loss", loss)
+        print(f"Epoch {e}, loss {loss.item():.4f}")
         optimizer.step()
         optimizer.zero_grad()
+    
+    t1 = time()
     # save model
-    print("done training")
+    print("Training time", f"{t1 - t0:.4f}")
 
     
 
